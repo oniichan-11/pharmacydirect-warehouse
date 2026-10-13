@@ -151,8 +151,14 @@ def describe_db_url(url: str) -> dict:
         hints.append("Pooler usernames look like `postgres.<project-ref>`, not just `postgres`.")
     if u.port == 6543:
         hints.append("Port 6543 is the Transaction pooler; use the Session pooler (port 5432).")
-    if not u.password or "YOUR-PASSWORD" in u.password.upper() or u.password.startswith("["):
-        hints.append("The password still looks like the placeholder; replace `[YOUR-PASSWORD]` (no brackets).")
+    ref = (u.username or "").partition(".")[2]
+    if ref.lower() in {"xxxx", "abcd1234", "your-project-ref", "project-ref"} or ref.startswith("["):
+        hints.append(f"`{u.username}` is a placeholder. Use the username from Supabase → Connect → Session pooler: "
+                     "`postgres.` followed by your ~20-character project ref.")
+    if (not u.password or u.password.upper() in {"PASSWORD", "YOURPASSWORD", "YOUR-DB-PASSWORD"}
+            or "YOUR-PASSWORD" in u.password.upper() or u.password.startswith("[")):
+        hints.append("The password still looks like the placeholder; replace it with your database password "
+                     "(no brackets).")
     return {"host": u.host, "port": u.port, "user": u.username, "database": u.database,
             "password_length": len(u.password or ""), "hints": hints}
 
