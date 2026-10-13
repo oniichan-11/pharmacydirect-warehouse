@@ -15,6 +15,7 @@ import calendar
 import datetime as dt
 import json
 import re
+from urllib.parse import unquote
 
 import pandas as pd
 import sqlalchemy as sa
@@ -119,14 +120,49 @@ class StockError(ValueError):
 
 
 # --------------------------------------------------------------------------- setup
+def parse_pg_url(url: str) -> sa.URL:
+    """Parse a postgres URL tolerantly: the password may contain unescaped @ : / # ? characters."""
+    url = url.strip().strip('"').strip("'")
+    scheme, sep, rest = url.partition("://")
+    if not sep or not scheme.startswith("postgres"):
+        raise ValueError("DATABASE_URL must start with postgresql://")
+    creds, at, hostpart = rest.rpartition("@")
+    if not at:
+        raise ValueError("DATABASE_URL has no user:password@ part")
+    user, _, password = creds.partition(":")
+    hostport, _, dbname = hostpart.partition("/")
+    dbname = dbname.split("?")[0] or "postgres"
+    host, _, port = hostport.partition(":")
+    return sa.URL.create("postgresql+psycopg2", username=unquote(user), password=unquote(password),
+                         host=host, port=int(port) if port else 5432, database=dbname)
+
+
+def describe_db_url(url: str) -> dict:
+    """Connection details without the password, plus likely-misconfiguration hints."""
+    try:
+        u = parse_pg_url(url)
+    except Exception as e:
+        return {"problem": str(e)}
+    hints = []
+    if u.host and u.host.startswith("db.") and u.host.endswith(".supabase.co"):
+        hints.append("This is Supabase's *Direct connection* host (IPv6-only). Use the **Session pooler** URI "
+                     "(host like aws-0-<region>.pooler.supabase.com).")
+    if "pooler.supabase.com" in (u.host or "") and "." not in (u.username or ""):
+        hints.append("Pooler usernames look like `postgres.<project-ref>`, not just `postgres`.")
+    if u.port == 6543:
+        hints.append("Port 6543 is the Transaction pooler; use the Session pooler (port 5432).")
+    if not u.password or "YOUR-PASSWORD" in u.password.upper() or u.password.startswith("["):
+        hints.append("The password still looks like the placeholder; replace `[YOUR-PASSWORD]` (no brackets).")
+    return {"host": u.host, "port": u.port, "user": u.username, "database": u.database,
+            "password_length": len(u.password or ""), "hints": hints}
+
+
 def make_engine(url: str) -> sa.Engine:
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    if url.startswith("postgresql://"):
-        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
     kw = {"pool_pre_ping": True}
-    if url.startswith("postgresql"):
-        kw.update(pool_size=3, max_overflow=2, pool_recycle=300)
+    if url.startswith("postgres"):
+        url = parse_pg_url(url)
+        kw.update(pool_size=3, max_overflow=2, pool_recycle=300,
+                  connect_args={"sslmode": "require", "connect_timeout": 10})
     return sa.create_engine(url, **kw)
 
 

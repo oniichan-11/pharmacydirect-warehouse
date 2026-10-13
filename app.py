@@ -36,9 +36,30 @@ def get_engine(url: str):
     return eng
 
 
+def show_db_error(url: str, err: Exception):
+    info = db.describe_db_url(url)
+    msg = str(getattr(err, "orig", None) or err)
+    try:
+        pw = db.parse_pg_url(url).password
+        if pw:
+            msg = msg.replace(pw, "****")
+    except Exception:
+        pass
+    st.error("**Could not connect to the database.** Check `DATABASE_URL` in the app's Secrets.")
+    for h in info.pop("hints", []):
+        st.warning(h)
+    st.write("Connection details being used (password hidden):")
+    st.json(info)
+    st.code(msg.strip()[:1500], language="text")
+    st.stop()
+
+
 DB_URL = secret("DATABASE_URL")
 LOCAL_MODE = not DB_URL
-engine = get_engine(DB_URL or f"sqlite:///{APP_DIR / 'warehouse_local.db'}")
+try:
+    engine = get_engine(DB_URL or f"sqlite:///{APP_DIR / 'warehouse_local.db'}")
+except Exception as e:
+    show_db_error(DB_URL or "", e)
 
 
 def bump(key: str):
