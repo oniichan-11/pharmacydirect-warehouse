@@ -10,13 +10,15 @@ import streamlit as st
 
 import db
 import reports
+import theme
 
-st.set_page_config(page_title="PDGH Warehouse", page_icon="📦", layout="wide")
+st.set_page_config(page_title="PDGH Warehouse", page_icon=str(theme.LOGO_PATH) if theme.logo_exists() else "📦",
+                   layout="wide", initial_sidebar_state="expanded")
+theme.apply()
 
 APP_DIR = Path(__file__).parent
 SEED_FILE = APP_DIR / "data" / "opening_stock.csv"
-STATUS_COLORS = {"Expired": "background-color:#f4c7c3", "≤ 3 months": "background-color:#fce8b2",
-                 "≤ 6 months": "background-color:#fff5d6"}
+STATUS_COLORS = theme.STATUS_COLORS
 
 
 # --------------------------------------------------------------------------- config / connection
@@ -89,7 +91,9 @@ def login() -> str | None:
     shared_pw = secret("APP_PASSWORD")
     if st.session_state.get("user"):
         return st.session_state["user"]
-    st.title("📦 PharmacyDirect GH — Warehouse")
+    if theme.logo_exists():
+        st.image(str(theme.LOGO_PATH), width=150)
+    theme.header("Central Warehouse", "PharmacyDirect GH · sign in to record and track stock movements.")
     with st.form("login"):
         name = st.text_input("Your name", help="Recorded against every transaction you enter")
         pw = st.text_input("Password", type="password") if (users or shared_pw) else ""
@@ -123,11 +127,15 @@ if not USER:
 PAGES = ["Dashboard", "Stock on Hand", "Receive Stock", "Transfer to Branch", "Returns & Adjustments",
          "Transaction History", "Products & Batches", "Reports & Export", "Setup & Import"]
 with st.sidebar:
-    st.markdown("### 📦 PDGH Warehouse")
+    if theme.logo_exists():
+        st.image(str(theme.LOGO_PATH), width=130)
+    else:
+        st.markdown("### 📦 PDGH Warehouse")
+    theme.side_meta({"Site": "Central Warehouse", "Signed in as": USER})
     page = st.radio("Go to", PAGES, label_visibility="collapsed")
     st.divider()
-    st.caption(f"Signed in as **{USER}**")
-    if st.button("Sign out"):
+    st.caption(f"Storage · {'Local SQLite (test)' if LOCAL_MODE else 'Supabase'}")
+    if st.button("Sign out", width="stretch"):
         st.session_state.clear()
         st.rerun()
     if LOCAL_MODE:
@@ -159,7 +167,7 @@ def batch_table(df: pd.DataFrame) -> pd.DataFrame:
 
 # =========================================================================== pages
 def page_dashboard():
-    st.title("Dashboard")
+    theme.header("Dashboard", "Stock position, expiry watch and this month's branch transfers at a glance.")
     show_flash()
     bdf = db.stock_by_batch(engine)
     pdf = db.stock_by_product(bdf)
@@ -214,7 +222,7 @@ def page_dashboard():
 
 
 def page_stock():
-    st.title("Stock on Hand")
+    theme.header("Stock on Hand", "Every product and batch in the warehouse, on any date you choose.")
     c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
     q = c1.text_input("Search product / manufacturer", placeholder="e.g. amlodipine, teva")
     cats = c2.multiselect("Category", db.CATEGORIES)
@@ -263,7 +271,7 @@ def new_product_form(key: str):
 
 
 def page_receive():
-    st.title("Receive Stock")
+    theme.header("Receive Stock", "Record goods arriving from overseas or local suppliers, against the invoice.")
     st.caption("New arrivals from overseas or local distributors. Each line becomes a batch (product + expiry).")
     show_flash()
     new_product_form("rcv")
@@ -337,7 +345,7 @@ def page_receive():
 
 
 def page_transfer():
-    st.title("Transfer to Branch")
+    theme.header("Transfer to Branch", "Issue stock to a branch, earliest expiry first, with a signable transfer note.")
     st.caption("Issue stock from the warehouse to a retail branch. Batches are listed earliest-expiry first "
                "(FEFO); send the earliest dates first.")
     show_flash()
@@ -405,7 +413,7 @@ def page_transfer():
 
 
 def page_adjust():
-    st.title("Returns & Adjustments")
+    theme.header("Returns & Adjustments", "Branch returns, write-offs and physical-count corrections.")
     show_flash()
     t1, t2, t3 = st.tabs(["↩ Return from branch", "🗑 Write-off (expired / damaged)", "🔢 Stock count correction"])
     all_b = db.stock_by_batch(engine, include_zero=True)
@@ -513,7 +521,7 @@ def page_adjust():
 
 
 def page_history():
-    st.title("Transaction History")
+    theme.header("Transaction History", "The full, traceable ledger. Inspect, void and re-print documents.")
     show_flash()
     c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
     rng = c1.date_input("Date range", (TODAY - dt.timedelta(days=30), TODAY))
@@ -571,7 +579,7 @@ def page_history():
 
 
 def page_products():
-    st.title("Products & Batches")
+    theme.header("Products & Batches", "Catalogue settings, reorder levels and batch corrections.")
     show_flash()
     t1, t2, t3 = st.tabs(["Product catalogue", "Correct a batch (expiry / batch no.)", "Change log"])
     with t1:
@@ -635,7 +643,7 @@ def page_products():
 
 
 def page_reports():
-    st.title("Reports & Export")
+    theme.header("Reports & Export", "Excel snapshots and branch statements to share with anyone who asks.")
     st.caption("Download a snapshot to share with management, auditors or the branches.")
     c1, c2 = st.columns(2)
     as_of = c1.date_input("Stock position as of", TODAY, max_value=TODAY)
@@ -675,7 +683,7 @@ def page_reports():
 
 
 def page_setup():
-    st.title("Setup & Import")
+    theme.header("Setup & Import", "Opening stock, branches, suppliers and database status.")
     show_flash()
     st.subheader("1 · Opening stock")
     if db.has_opening(engine):

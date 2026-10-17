@@ -1,5 +1,12 @@
+# Brand theme, shared with the walk-in demand tracker (Pharmacy Direct logo: navy #01528A, amber #F6A925).
+# Finer styling lives in theme.py.
 [theme]
-primaryColor = "#1F4E5A"
+base = "light"
+primaryColor = "#01528A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F8FB"
+textColor = "#16202B"
+font = "sans serif"
 
 [server]
 maxUploadSize = 20
