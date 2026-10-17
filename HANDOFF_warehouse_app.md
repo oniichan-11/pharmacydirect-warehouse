@@ -31,12 +31,14 @@ warehouse-app/
 ├── app.py                  Streamlit UI, all pages (~700 lines)
 ├── db.py                   Schema (SQLAlchemy Core), ledger posting/validation, stock queries, import
 ├── reports.py              Excel snapshot (xlsxwriter) and transfer-note builder
+├── theme.py                Brand CSS (navy/amber, Inter + Sora), shared look with walk-in-demand-tracker
+├── assets/logo.png         Pharmacy Direct logo
 ├── data/opening_stock.csv  Verified opening count (210 lines, 4,900 units)
 ├── requirements.txt        streamlit>=1.50, pandas, SQLAlchemy>=2, psycopg2-binary, XlsxWriter, openpyxl
 ├── README.md               Deployment guide (Supabase → GitHub → Streamlit Cloud) and operating rules
 ├── .gitignore              Excludes secrets.toml, *.db, __pycache__
 └── .streamlit/
-    ├── config.toml         Theme (primary #1F4E5A)
+    ├── config.toml         Theme (brand navy #01528A, same as the walk-in tracker)
     └── secrets.toml.example  DATABASE_URL and a [users] name = "password" table
 ```
 
