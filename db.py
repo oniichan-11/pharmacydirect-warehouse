@@ -501,27 +501,43 @@ def import_opening_stock(engine, df: pd.DataFrame, txn_date: dt.date, user: str,
     missing = [c for c in ["product", "qty"] if c not in df.columns]
     if missing:
         raise ValueError(f"Missing column(s): {', '.join(missing)}")
+    def val(r, col, default=""):
+        v = r.get(col)
+        return default if v is None or pd.isna(v) or not str(v).strip() else str(v).strip()
+
+    # 1. validate every row in Python first, so problems are reported plainly and nothing touches the DB
+    rows, errors = [], []
+    for i, r in df.iterrows():
+        try:
+            if not val(r, "product"):
+                continue
+            qty = int(float(r["qty"]))
+            if qty <= 0:
+                continue
+            rows.append(dict(name=val(r, "product"), mfr=val(r, "manufacturer"), cat=val(r, "category", "Other"),
+                             unit=val(r, "unit", "pcs"), exp=parse_expiry(r[exp_col]) if exp_col else None,
+                             bno=val(r, "batch_no"), note=val(r, "note"), qty=qty))
+        except Exception as e:  # collect all problems, then abort
+            errors.append(f"Row {i + 2} ({val(r, 'product') or 'no product'}): {e}")
+    if errors:
+        raise ValueError("Import stopped, nothing was saved:\n" + "\n".join(errors[:30]))
+    if not rows:
+        raise ValueError("No rows with a product and a quantity above zero")
+
+    # 2. post atomically; the lock + re-check stops a double-click or a second tab importing twice
     with engine.begin() as c:
-        items, errors = [], []
-        for i, r in df.iterrows():
-            try:
-                if pd.isna(r["product"]) or not str(r["product"]).strip():
-                    continue
-                qty = int(float(r["qty"]))
-                if qty <= 0:
-                    continue
-                pid = get_or_create_product(
-                    c, str(r["product"]), "" if pd.isna(r.get("manufacturer")) else str(r.get("manufacturer", "")),
-                    "Other" if pd.isna(r.get("category")) else str(r.get("category") or "Other"),
-                    "pcs" if pd.isna(r.get("unit")) else str(r.get("unit") or "pcs"), user=user)
-                exp = parse_expiry(r[exp_col]) if exp_col else None
-                bno = "" if pd.isna(r.get("batch_no")) else str(r.get("batch_no") or "")
-                note_l = "" if pd.isna(r.get("note")) else str(r.get("note") or "")
-                items.append({"batch_id": get_or_create_batch(c, pid, exp, bno), "qty": qty, "line_note": note_l})
-            except Exception as e:  # collect all problems, then abort
-                errors.append(f"Row {i + 2}: {e}")
-        if errors:
-            raise ValueError("Import stopped, nothing was saved:\n" + "\n".join(errors[:30]))
+        if c.dialect.name == "postgresql":
+            c.execute(sa.text("SELECT pg_advisory_xact_lock(4242001)"))
+        existing = c.execute(select(transactions.c.txn_no).where(
+            transactions.c.txn_type == "OPENING", transactions.c.voided_by_id.is_(None))).scalar()
+        if existing:
+            raise ValueError(f"Opening stock is already loaded ({existing}); nothing was imported. "
+                             "To redo it, void that transaction in Transaction History first.")
+        items = []
+        for r in rows:
+            pid = get_or_create_product(c, r["name"], r["mfr"], r["cat"], r["unit"], user=user)
+            items.append({"batch_id": get_or_create_batch(c, pid, r["exp"], r["bno"]), "qty": r["qty"],
+                          "line_note": r["note"]})
         txn_no = post_transaction(engine, "OPENING", txn_date, items, user, "Warehouse count", "", note, conn=c)
         return txn_no, len(items)
 

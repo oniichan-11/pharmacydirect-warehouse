@@ -707,10 +707,14 @@ def page_setup():
                 else:
                     df = raw.iloc[hdr + 1:].copy()
                     df.columns = [str(c).strip() for c in raw.iloc[hdr]]
+                    df.index = df.index - 1  # so the import's "Row n" matches the spreadsheet row number
                     df = df[df["Product" if "Product" in df.columns else df.columns[
                         [c.lower() for c in df.columns].index("product")]].astype(str).str.strip() != ""]
         if df is not None:
             st.caption(f"{len(df)} rows")
+            if "category" not in {str(c).strip().lower() for c in df.columns}:
+                st.info("This file has no Category column, so new products will be filed under 'Other'. "
+                        "The bundled count sheets already carry categories.")
             if "needs_check" in df.columns:
                 flagged = df[df["needs_check"].str.upper() == "YES"]
                 if len(flagged):
