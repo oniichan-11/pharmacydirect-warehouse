@@ -44,6 +44,7 @@ products = Table(
     Column("id", Integer, primary_key=True),
     Column("name", String(200), nullable=False),
     Column("manufacturer", String(120), nullable=False, default=""),
+    Column("code", String(20), nullable=False, default=""),  # warehouse code, e.g. WH-0042
     Column("category", String(80), nullable=False, default="Other"),
     Column("unit", String(30), nullable=False, default="pcs"),
     Column("reorder_level", Integer, nullable=False, default=0),
@@ -101,6 +102,8 @@ TXN_TYPES = {
     "TRANSFER": ("TRF", "Transfer to branch", -1),
     "RETURN": ("RET", "Return from branch", +1),
     "WRITE_OFF": ("WOF", "Write-off", -1),
+    "SALE": ("WSL", "Wholesale sale", -1),
+    "SUPPLIER_RETURN": ("RTS", "Return to supplier", -1),
     "ADJUSTMENT": ("ADJ", "Count adjustment", 0),
     "REVERSAL": ("REV", "Void / reversal", 0),
 }
@@ -174,6 +177,10 @@ def make_engine(url: str) -> sa.Engine:
 
 def init_db(engine: sa.Engine) -> None:
     metadata.create_all(engine)
+    # additive migrations for databases created before a column existed
+    if "code" not in {col["name"] for col in sa.inspect(engine).get_columns("products")}:
+        with engine.begin() as c:
+            c.execute(sa.text("ALTER TABLE products ADD COLUMN code VARCHAR(20) NOT NULL DEFAULT ''"))
     with engine.begin() as c:
         if c.execute(select(func.count()).select_from(branches)).scalar() == 0:
             c.execute(branches.insert(), [{"name": b, "active": True} for b in DEFAULT_BRANCHES])
@@ -230,8 +237,9 @@ def expiry_status(exp, today: dt.date | None = None) -> str:
     return "OK"
 
 
-def product_label(name: str, manufacturer: str) -> str:
-    return f"{name} — {manufacturer}" if manufacturer else name
+def product_label(name: str, manufacturer: str, code: str = "") -> str:
+    label = f"{name} — {manufacturer}" if manufacturer else name
+    return f"{code} · {label}" if code else label
 
 
 def log(conn, user: str, action: str, details) -> None:
@@ -279,7 +287,7 @@ def list_products(engine, active_only=False) -> pd.DataFrame:
         q = q.where(products.c.active.is_(True))
     with engine.connect() as c:
         df = pd.read_sql(q, c)
-    df["label"] = [product_label(n, m) for n, m in zip(df["name"], df["manufacturer"])]
+    df["label"] = [product_label(n, m, k) for n, m, k in zip(df["name"], df["manufacturer"], df["code"])]
     return df
 
 
@@ -363,7 +371,7 @@ def stock_by_batch(engine, as_of: dt.date | None = None, include_zero=False) -> 
     if as_of:
         sub = sub.where(transactions.c.txn_date <= as_of)
     sub = sub.group_by(movements.c.batch_id).subquery()
-    q = (select(batches.c.id.label("batch_id"), products.c.id.label("product_id"), products.c.name,
+    q = (select(batches.c.id.label("batch_id"), products.c.id.label("product_id"), products.c.code, products.c.name,
                 products.c.manufacturer, products.c.category, products.c.unit, products.c.reorder_level,
                 batches.c.expiry_date, batches.c.batch_no, func.coalesce(sub.c.on_hand, 0).label("on_hand"))
          .select_from(batches.join(products, batches.c.product_id == products.c.id)
@@ -377,17 +385,17 @@ def stock_by_batch(engine, as_of: dt.date | None = None, include_zero=False) -> 
     today = as_of or dt.date.today()
     df["status"] = [expiry_status(e, today) for e in df["expiry_date"]]
     df["days_left"] = [None if (e is None or pd.isna(e)) else (e - today).days for e in df["expiry_date"]]
-    df["label"] = [product_label(n, m) for n, m in zip(df["name"], df["manufacturer"])]
+    df["label"] = [product_label(n, m, k) for n, m, k in zip(df["name"], df["manufacturer"], df["code"])]
     return df.sort_values(["name", "manufacturer", "expiry_date"], na_position="last").reset_index(drop=True)
 
 
 def stock_by_product(batch_df: pd.DataFrame) -> pd.DataFrame:
     if batch_df.empty:
-        return pd.DataFrame(columns=["name", "manufacturer", "category", "unit", "on_hand", "batches",
+        return pd.DataFrame(columns=["code", "name", "manufacturer", "category", "unit", "on_hand", "batches",
                                      "earliest_expiry", "expired_qty", "reorder_level", "low_stock"])
     d = batch_df.copy()
     d["expired_qty"] = d["on_hand"].where(d["status"] == "Expired", 0)
-    g = (d.groupby(["product_id", "name", "manufacturer", "category", "unit", "reorder_level"], dropna=False)
+    g = (d.groupby(["product_id", "code", "name", "manufacturer", "category", "unit", "reorder_level"], dropna=False)
          .agg(on_hand=("on_hand", "sum"), batches=("batch_id", "count"),
               earliest_expiry=("expiry_date", lambda s: min([x for x in s if x is not None and not pd.isna(x)],
                                                             default=None)),
@@ -540,6 +548,227 @@ def import_opening_stock(engine, df: pd.DataFrame, txn_date: dt.date, user: str,
                           "line_note": r["note"]})
         txn_no = post_transaction(engine, "OPENING", txn_date, items, user, "Warehouse count", "", note, conn=c)
         return txn_no, len(items)
+
+
+# --------------------------------------------------------------------------- stock-take workbook
+# Movement types used in the warehouse stock-take workbook -> (txn_type, sign). "Issued to <branch>" is
+# handled separately; a Stock Adjustment keeps the sign typed in the sheet.
+WORKBOOK_TYPES = {
+    "received from supplier": ("RECEIPT", +1),
+    "wholesale sale (client)": ("SALE", -1),
+    "returned to warehouse": ("RETURN", +1),
+    "returned to supplier": ("SUPPLIER_RETURN", -1),
+    "damaged / expired": ("WRITE_OFF", -1),
+}
+
+
+def _sheet_table(xls: pd.ExcelFile, sheet: str, must_have: set[str]) -> pd.DataFrame:
+    """Read a sheet whose header row sits below a title block."""
+    raw = pd.read_excel(xls, sheet, header=None, dtype=object)
+    for i, row in raw.iterrows():
+        cells = [str(v).strip() for v in row]
+        if must_have <= {c.lower() for c in cells}:
+            df = raw.iloc[i + 1:].copy()
+            df.columns = cells
+            df.index = df.index + 1  # spreadsheet row numbers
+            return df
+    raise ValueError(f"Sheet '{sheet}': couldn't find a header row with {', '.join(sorted(must_have))}")
+
+
+def _cell(v, default=""):
+    if v is None or (not isinstance(v, str) and pd.isna(v)) or not str(v).strip():
+        return default
+    return str(v).strip()
+
+
+def _num(v) -> int:
+    return int(float(_cell(v, "0")))
+
+
+def read_stocktake_workbook(file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (stock, movements) from the stock-take workbook ('Stock' and 'Movements' sheets)."""
+    xls = pd.ExcelFile(file)
+    names = {s.lower(): s for s in xls.sheet_names}
+    if "stock" not in names:
+        raise ValueError("The workbook needs a 'Stock' sheet")
+    stock = _sheet_table(xls, names["stock"], {"code", "product", "opening stock"})
+    stock = stock[[bool(_cell(v)) for v in stock["Code"]]]
+    if "movements" in names:
+        movs = _sheet_table(xls, names["movements"], {"date", "code", "movement type", "quantity"})
+        movs = movs[[bool(_cell(v)) for v in movs["Code"]]]
+    else:
+        movs = pd.DataFrame(columns=["Date", "Code", "Movement Type", "Quantity"])
+    return stock, movs
+
+
+def _plan_stocktake(engine, stock: pd.DataFrame, movs: pd.DataFrame) -> dict:
+    """Validate the workbook and work out everything apply_stocktake will post. Touches nothing."""
+    errors: list[str] = []
+    col = {c.lower(): c for c in stock.columns}
+    exp_col = next((col[k] for k in col if k.startswith("expiry")), None)
+    get = lambda r, name, default="": _cell(r[col[name]], default) if name in col else default  # noqa: E731
+    items: dict[str, dict] = {}
+    seen_names: set[str] = set()
+    for rn, r in stock.iterrows():
+        code, name = get(r, "code"), get(r, "product")
+        try:
+            if not name:
+                raise ValueError("product name is empty")
+            if code in items:
+                raise ValueError(f"code {code} appears twice")
+            if name.lower() in seen_names:
+                raise ValueError(f"product '{name}' appears twice")
+            exp_raw = _cell(r[exp_col]) if exp_col else ""
+            it = dict(code=code, name=name, unit=get(r, "unit", "pcs")[:30],
+                      expiry=None if exp_raw.lower() in {"", "no expiry"} else parse_expiry(exp_raw),
+                      opening=_num(get(r, "opening stock", "0")), reorder=_num(get(r, "reorder level", "0")),
+                      current=_num(get(r, "current stock")) if "current stock" in col else None)
+            if it["opening"] < 0:
+                raise ValueError("opening stock is negative")
+            items[code] = it
+            seen_names.add(name.lower())
+        except Exception as e:
+            errors.append(f"Stock sheet row {rn} ({code or '?'} {name}): {e}")
+
+    branches_known = {b.lower(): b for b in list_branches(engine, active_only=False)}
+    balance = {k: v["opening"] for k, v in items.items()}
+    lines = []  # kept in sheet order
+    mcol = {c.lower(): c for c in movs.columns}
+    mget = lambda r, name: _cell(r[mcol[name]]) if name in mcol else ""  # noqa: E731
+    for rn, r in movs.iterrows():
+        code, mtype = mget(r, "code"), mget(r, "movement type")
+        try:
+            if code not in items:
+                raise ValueError(f"code {code} is not on the Stock sheet")
+            qty, key, party = _num(mget(r, "quantity")), mtype.lower(), mget(r, "branch / client / supplier")
+            if key.startswith("issued to "):
+                branch = branches_known.get(key[len("issued to "):].strip())
+                if not branch:
+                    raise ValueError(f"'{mtype}': no such branch in the app (add it under Setup first)")
+                ttype, signed, party = "TRANSFER", -abs(qty), branch
+            elif key.startswith("stock adjustment"):
+                ttype, signed = "ADJUSTMENT", qty
+            elif key in WORKBOOK_TYPES:
+                ttype, sign = WORKBOOK_TYPES[key]
+                signed = sign * abs(qty)
+            else:
+                raise ValueError(f"unknown movement type '{mtype}'")
+            if signed == 0:
+                continue
+            if not party and ttype in ("RETURN", "SALE", "SUPPLIER_RETURN"):
+                party = "Not specified"
+            balance[code] += signed
+            if balance[code] < 0:
+                raise ValueError(f"stock would go negative ({balance[code]}) at this movement")
+            d = r[mcol["date"]]
+            date = pd.Timestamp(d).date() if isinstance(d, (dt.date, pd.Timestamp)) else parse_expiry(d)
+            if date is None:
+                raise ValueError("date is missing")
+            lines.append(dict(code=code, date=date, type=ttype, qty=signed, party=party[:150],
+                              ref=mget(r, "reference (invoice / waybill)")[:100], note=mget(r, "notes")[:200],
+                              by=mget(r, "entered by")[:80]))
+        except Exception as e:
+            errors.append(f"Movements sheet row {rn} ({code} {mtype}): {e}")
+
+    mismatches = [f"{k} {it['name']}: sheet says {it['current']}, opening + movements give {balance[k]}"
+                  for k, it in items.items() if it["current"] is not None and it["current"] != balance[k]]
+    if mismatches:
+        errors.append("Current Stock doesn't match opening + movements for:\n  " + "\n  ".join(mismatches[:20]))
+
+    old = stock_by_batch(engine)
+    new_names = {it["name"].lower() for it in items.values()}
+    act = list_products(engine, active_only=True)
+    in_new = act["name"].str.lower().isin(new_names)
+    return dict(items=items, lines=lines, errors=errors, balance=balance, old_batches=old,
+                old_units=int(old["on_hand"].sum()) if len(old) else 0, retire=act[~in_new], reused=act[in_new],
+                opening_units=sum(it["opening"] for it in items.values()), final_units=sum(balance.values()))
+
+
+def stocktake_preview(engine, stock: pd.DataFrame, movs: pd.DataFrame) -> dict:
+    p = _plan_stocktake(engine, stock, movs)
+    by_type = pd.Series([l["type"] for l in p["lines"]]).value_counts().to_dict() if p["lines"] else {}
+    return {"products": len(p["items"]), "opening_units": p["opening_units"], "movements": len(p["lines"]),
+            "movements_by_type": by_type, "final_units": p["final_units"], "old_units": p["old_units"],
+            "retire": len(p["retire"]), "reused": len(p["reused"]), "errors": p["errors"]}
+
+
+def apply_stocktake(engine, stock: pd.DataFrame, movs: pd.DataFrame, count_date: dt.date, user: str,
+                    tag: str) -> list[str]:
+    """Switch the warehouse to a stock-take workbook, keeping history (nothing is deleted):
+    1. one ADJUSTMENT zeroes every batch still in stock, and the old products are deactivated;
+    2. the counted 'Opening Stock' is posted as an OPENING dated count_date;
+    3. the Movements sheet is replayed as receipts / transfers / sales / returns / write-offs / adjustments.
+    All or nothing; refuses to run twice for the same tag. Returns the transaction numbers posted."""
+    p = _plan_stocktake(engine, stock, movs)
+    if p["errors"]:
+        raise ValueError("Stock-take not applied, nothing was saved:\n" + "\n".join(p["errors"][:30]))
+    posted: list[str] = []
+    with engine.begin() as c:
+        if c.dialect.name == "postgresql":
+            c.execute(sa.text("SELECT pg_advisory_xact_lock(4242001)"))
+        done = c.execute(select(transactions.c.txn_no).where(
+            transactions.c.reference == tag, transactions.c.voided_by_id.is_(None))).scalar()
+        if done:
+            raise ValueError(f"This stock-take has already been applied ({done}); nothing was changed.")
+
+        # 1. retire the old list
+        old_ids = [int(b) for b in p["old_batches"]["batch_id"]]
+        avail = batch_available(c, old_ids) if old_ids else {}
+        zero = [{"batch_id": b, "qty": -q, "line_note": "Replaced by stock-take"} for b, q in avail.items() if q]
+        if zero:
+            posted.append(post_transaction(
+                engine, "ADJUSTMENT", count_date, zero, user, "", tag,
+                f"Old stock list retired; replaced by the stock-take of {count_date:%d %b %Y}", conn=c))
+        retire_ids = [int(i) for i in p["retire"]["id"]]
+        if retire_ids:
+            c.execute(products.update().where(products.c.id.in_(retire_ids)).values(active=False))
+            log(c, user, "RETIRE_PRODUCTS", {"tag": tag, "count": len(retire_ids)})
+
+        # 2. new catalogue + counted opening stock
+        batch_of = {}
+        for code, it in p["items"].items():
+            pid = get_or_create_product(c, it["name"], "", "Other", it["unit"], it["reorder"], user=user)
+            changes = {"code": code, "unit": it["unit"], "active": True}
+            if it["reorder"]:
+                changes["reorder_level"] = it["reorder"]
+            c.execute(products.update().where(products.c.id == pid).values(**changes))
+            batch_of[code] = get_or_create_batch(c, pid, it["expiry"])
+        opening = [{"batch_id": batch_of[k], "qty": it["opening"], "line_note": ""}
+                   for k, it in p["items"].items() if it["opening"] > 0]
+        posted.append(post_transaction(engine, "OPENING", count_date, opening, user, "Warehouse stock-take", tag,
+                                       f"Counted stock at the {count_date:%d %b %Y} stock check", conn=c))
+
+        # 3. replay the movements log; consecutive rows with the same date/type/party/reference become one txn
+        group: list[dict] = []
+
+        def flush():
+            if not group:
+                return
+            g = group[0]
+            if g["type"] == "RECEIPT":
+                ensure_supplier(c, g["party"], "Local")
+            by = next((l["by"] for l in group if l["by"]), "")
+            note = "From stock-take workbook" + (f" (entered by {by})" if by else "")
+            posted.append(post_transaction(
+                engine, g["type"], g["date"],
+                [{"batch_id": batch_of[l["code"]], "qty": l["qty"], "line_note": l["note"]} for l in group],
+                user, g["party"], g["ref"], note, conn=c))
+            group.clear()
+
+        key = lambda l: (l["date"], l["type"], l["party"], l["ref"])  # noqa: E731
+        for l in p["lines"]:
+            if group and key(l) != key(group[0]):
+                flush()
+            group.append(l)
+        flush()
+
+        # 4. verify every product ends where the workbook says it should
+        avail = batch_available(c, list(batch_of.values()))
+        off = [k for k, b in batch_of.items() if avail.get(b, 0) != p["balance"][k]]
+        if off:
+            raise ValueError(f"Check failed after posting ({', '.join(off[:10])}); nothing was saved.")
+        log(c, user, "APPLY_STOCKTAKE", {"tag": tag, "products": len(batch_of), "txns": len(posted)})
+    return posted
 
 
 # --------------------------------------------------------------------------- history / reporting

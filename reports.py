@@ -66,8 +66,8 @@ def snapshot_xlsx(engine, as_of: dt.date, start: dt.date, end: dt.date, user: st
              for b, g in (tb.groupby("branch") if len(tb) else [])], columns=["Item", "Value"])
         _write("Summary", s, w, COMPANY, stamp, widths={"Item": 42, "Value": 26})
 
-        p = pdf.rename(columns={"name": "Product", "manufacturer": "Manufacturer", "category": "Category",
-                                "unit": "Unit", "on_hand": "On hand", "batches": "Batches",
+        p = pdf.rename(columns={"code": "Code", "name": "Product", "manufacturer": "Manufacturer",
+                                "category": "Category", "unit": "Unit", "on_hand": "On hand", "batches": "Batches",
                                 "earliest_expiry": "Earliest expiry", "expired_qty": "Of which expired",
                                 "reorder_level": "Reorder level", "low_stock": "Low stock"})
         p = p.drop(columns=["product_id"], errors="ignore")
@@ -76,8 +76,9 @@ def snapshot_xlsx(engine, as_of: dt.date, start: dt.date, end: dt.date, user: st
         _write("Stock by Product", p, w, "Stock on hand by product", f"As of {as_of:%d %b %Y}. {stamp}",
                widths={"Product": 46})
 
-        b = bdf[["name", "manufacturer", "category", "expiry_date", "days_left", "status", "batch_no", "on_hand",
-                 "unit"]].rename(columns={"name": "Product", "manufacturer": "Manufacturer", "category": "Category",
+        b = bdf[["code", "name", "manufacturer", "category", "expiry_date", "days_left", "status", "batch_no",
+                 "on_hand", "unit"]].rename(columns={"code": "Code", "name": "Product",
+                                                     "manufacturer": "Manufacturer", "category": "Category",
                                           "expiry_date": "Expiry", "days_left": "Days left", "status": "Status",
                                           "batch_no": "Batch no.", "on_hand": "On hand", "unit": "Unit"})
         _write("Stock by Batch", b, w, "Stock on hand by batch (expiry)", f"As of {as_of:%d %b %Y}. {stamp}",

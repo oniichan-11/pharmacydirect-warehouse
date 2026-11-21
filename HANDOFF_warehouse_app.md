@@ -46,7 +46,7 @@ warehouse-app/
 
 - `branches(id, name UNIQUE, active)`, seeded with Adenta and Atomic
 - `suppliers(id, name UNIQUE, kind Local|Overseas, active)`, added automatically on first receipt
-- `products(id, name, manufacturer, category, unit, reorder_level, active, created_at)`, UNIQUE(name, manufacturer)
+- `products(id, name, manufacturer, code, category, unit, reorder_level, active, created_at)`, UNIQUE(name, manufacturer)
 - `batches(id, product_id, expiry_date NULLABLE, batch_no, created_at)`, identified by product + expiry + batch_no. NULL expiry is handled in code, because a NULL in a Postgres unique constraint never matches another NULL.
 - `transactions(id, txn_no UNIQUE, txn_type, txn_date, counterparty, reference, entered_by, note, created_at, reverses_id, voided_by_id)`
 - `movements(id, txn_id, batch_id, qty SIGNED, line_note)`. `qty` is the effect on **warehouse** stock: + means in, − means out.
@@ -61,6 +61,8 @@ Transaction types (`db.TXN_TYPES`), with their number prefix and the direction s
 | TRANSFER | `TRF` | − (counterparty = branch) |
 | RETURN | `RET` | + |
 | WRITE_OFF | `WOF` | − |
+| SALE | `WSL` | − (counterparty = wholesale client) |
+| SUPPLIER_RETURN | `RTS` | − (counterparty = supplier) |
 | ADJUSTMENT | `ADJ` | ± |
 | REVERSAL | `REV` | ± |
 
@@ -113,6 +115,13 @@ Transaction numbers look like `TRF-000123`.
 - **26 lines have no expiry recorded.** Several are medicines, not toiletries: Canesten, Anusol, Betnovate, Daktarin, Epiderm, Aciclovir cream and Aqueous Calamine. They import as "No expiry"; add the dates later through *Correct a batch*.
 - **Categories** were assigned by Claude for filtering (19 categories, listed in `db.CATEGORIES`). Nii can edit them in the app.
 - Units are `pcs`, except Galvus Met and Flucloxacillin (Fluxacin) 500mg (ECL), which are counted in `strips`.
+
+### Stock-take workbook (added 21 Nov 2026)
+
+- On 17 Nov 2026 the warehouse was recounted. The result is `Wholesale_Warehouse_Inventory_to_Observe.xlsx` (sheets *Stock*, *Movements*, *Movement Types*): 462 products with codes `WH-0001…`, 10,178 counted units, 236 logged movements on 17–18 Nov, **8,580 units current**. It is a different catalogue from the October list (only 12 names match), and it has no categories.
+- `db.apply_stocktake()` (Setup & Import → *Apply a stock-take workbook*) switches to it **without deleting history**: it posts one ADJUSTMENT that zeroes the old list and deactivates the old products, then an OPENING of the counted stock dated at the stock check, then replays the Movements sheet as RCV/TRF/WSL/RET/WOF/ADJ transactions. It is all-or-nothing, checks every product against the sheet's *Current Stock*, and refuses a second run with the same reference.
+- `products.code` was added by an additive migration in `init_db` (ALTER TABLE … ADD COLUMN).
+- The October list in `data/opening_stock.csv` is now historical.
 
 ## 5. Testing done
 

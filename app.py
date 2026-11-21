@@ -159,8 +159,8 @@ def batch_options(df: pd.DataFrame) -> dict[str, int]:
 
 
 def batch_table(df: pd.DataFrame) -> pd.DataFrame:
-    return df[["name", "manufacturer", "category", "expiry_date", "days_left", "status", "batch_no", "on_hand",
-               "unit"]].rename(columns={"name": "Product", "manufacturer": "Manufacturer", "category": "Category",
+    return df[["code", "name", "manufacturer", "category", "expiry_date", "days_left", "status", "batch_no",
+               "on_hand", "unit"]].rename(columns={"code": "Code", "name": "Product", "manufacturer": "Manufacturer", "category": "Category",
                                         "expiry_date": "Expiry", "days_left": "Days left", "status": "Status",
                                         "batch_no": "Batch no.", "on_hand": "On hand", "unit": "Unit"})
 
@@ -224,14 +224,15 @@ def page_dashboard():
 def page_stock():
     theme.header("Stock on Hand", "Every product and batch in the warehouse, on any date you choose.")
     c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-    q = c1.text_input("Search product / manufacturer", placeholder="e.g. amlodipine, teva")
+    q = c1.text_input("Search product / code", placeholder="e.g. amlodipine, WH-0042")
     cats = c2.multiselect("Category", db.CATEGORIES)
     status = c3.multiselect("Expiry status", ["Expired", "≤ 3 months", "≤ 6 months", "OK", "No expiry"])
     as_of = c4.date_input("As of date", TODAY, help="See the stock position on any past date")
     bdf = db.stock_by_batch(engine, as_of=as_of)
     if q:
-        m = bdf["name"].str.contains(q, case=False, na=False) | bdf["manufacturer"].str.contains(q, case=False,
-                                                                                                    na=False)
+        m = (bdf["name"].str.contains(q, case=False, na=False, regex=False)
+             | bdf["manufacturer"].str.contains(q, case=False, na=False, regex=False)
+             | bdf["code"].str.contains(q, case=False, na=False, regex=False))
         bdf = bdf[m]
     if cats:
         bdf = bdf[bdf["category"].isin(cats)]
@@ -415,8 +416,41 @@ def page_transfer():
 def page_adjust():
     theme.header("Returns & Adjustments", "Branch returns, write-offs and physical-count corrections.")
     show_flash()
-    t1, t2, t3 = st.tabs(["↩ Return from branch", "🗑 Write-off (expired / damaged)", "🔢 Stock count correction"])
+    t1, t4, t5, t2, t3 = st.tabs(["↩ Return from branch", "💼 Wholesale sale", "📦 Return to supplier",
+                                  "🗑 Write-off (expired / damaged)", "🔢 Stock count correction"])
     all_b = db.stock_by_batch(engine, include_zero=True)
+
+    for tab, ttype, who_label, who_opts, verb in [
+            (t4, "SALE", "Client (hospital / pharmacy)", [], "sale"),
+            (t5, "SUPPLIER_RETURN", "Supplier", db.list_suppliers(engine)["name"].tolist(), "supplier return")]:
+        with tab:
+            st.caption("Supplies to hospitals and other pharmacies." if ttype == "SALE"
+                       else "Stock sent back to the supplier, e.g. wrong item, short-dated or damaged on arrival.")
+            instock = all_b[(all_b["on_hand"] > 0) & (all_b["status"] != "Expired")]
+            if instock.empty:
+                st.info("No stock available.")
+                continue
+            opts = batch_options(instock)
+            with st.form(f"f_{ttype}", clear_on_submit=True):
+                a, c = st.columns([5, 1])
+                lab = a.selectbox("Batch", list(opts))
+                q = c.number_input("Qty", 1, step=1)
+                d1, d2, d3 = st.columns([1, 2, 2])
+                rd = d1.date_input("Date", TODAY, max_value=TODAY)
+                who = (d2.selectbox(who_label, who_opts) if who_opts else d2.text_input(who_label))
+                ref = d3.text_input("Reference (invoice / waybill)")
+                note = st.text_input("Note")
+                if st.form_submit_button(f"Post {verb}", type="primary"):
+                    if not (who or "").strip():
+                        st.error(f"Enter the {who_label.split(' (')[0].lower()}")
+                    else:
+                        try:
+                            no = db.post_transaction(engine, ttype, rd, [{"batch_id": opts[lab], "qty": -int(q)}],
+                                                     USER, who.strip(), ref.strip(), note.strip())
+                            flash(f"{verb.capitalize()} {no} posted.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
     with t1:
         st.caption("Stock coming back from a branch, e.g. short-dated items or wrong items sent.")
@@ -682,6 +716,48 @@ def page_reports():
                       f"stock_by_product_{as_of}.csv", "text/csv")
 
 
+def stocktake_section():
+    st.subheader("Apply a stock-take workbook")
+    st.write("Switch the warehouse to a new stock-take (the *Stock* + *Movements* workbook). The old list is "
+             "zeroed with one dated adjustment and hidden, the counted opening stock is loaded, and the movements "
+             "log is replayed as real transactions. Nothing is deleted, and nothing is saved unless every product "
+             "ends exactly at the workbook's *Current Stock*.")
+    up = st.file_uploader("Stock-take workbook (.xlsx)", type=["xlsx"], key="st_wb")
+    if not up:
+        return
+    try:
+        stock, movs = db.read_stocktake_workbook(up)
+        pv = db.stocktake_preview(engine, stock, movs)
+    except Exception as e:
+        st.error(str(e))
+        return
+    if pv["errors"]:
+        st.error("The workbook has problems; fix them and upload again:\n\n" +
+                 "\n".join(f"- {e}" for e in pv["errors"][:30]))
+        return
+    c = st.columns(4)
+    c[0].metric("Products", f"{pv['products']:,}")
+    c[1].metric("Counted (opening)", f"{pv['opening_units']:,}")
+    c[2].metric("Movements to replay", f"{pv['movements']:,}")
+    c[3].metric("Units after", f"{pv['final_units']:,}")
+    st.info(f"Old list: **{pv['old_units']:,} units** will be zeroed and **{pv['retire']} products** hidden. "
+            f"{pv['reused']} products with the same name are kept and updated. Movements: "
+            + ", ".join(f"{n} × {db.TXN_TYPES[t][1].lower()}" for t, n in pv["movements_by_type"].items()))
+    a, b = st.columns(2)
+    count_date = a.date_input("Date of the stock check", TODAY, max_value=TODAY, key="st_date")
+    tag = b.text_input("Reference", f"Stock-take {count_date:%d/%m/%Y}", key="st_tag")
+    ok = st.checkbox("I understand this replaces the warehouse stock list", key="st_ok")
+    if st.button("Apply stock-take", type="primary", disabled=not ok):
+        with st.spinner("Posting the stock-take…"):
+            try:
+                posted = db.apply_stocktake(engine, stock, movs, count_date, USER, tag.strip())
+                flash(f"Stock-take applied: {len(posted)} transactions posted ({posted[0]} … {posted[-1]}). "
+                      f"{pv['final_units']:,} units on hand.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+
 def page_setup():
     theme.header("Setup & Import", "Opening stock, branches, suppliers and database status.")
     show_flash()
@@ -737,6 +813,8 @@ def page_setup():
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
+    st.divider()
+    stocktake_section()
     st.divider()
     st.subheader("2 · Branches")
     st.write(", ".join(db.list_branches(engine)))
