@@ -223,19 +223,16 @@ def page_dashboard():
 
 def page_stock():
     theme.header("Stock on Hand", "Every product and batch in the warehouse, on any date you choose.")
-    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    c1, c2, c3 = st.columns([4, 3, 2])
     q = c1.text_input("Search product / code", placeholder="e.g. amlodipine, WH-0042")
-    cats = c2.multiselect("Category", db.CATEGORIES)
-    status = c3.multiselect("Expiry status", ["Expired", "≤ 3 months", "≤ 6 months", "OK", "No expiry"])
-    as_of = c4.date_input("As of date", TODAY, help="See the stock position on any past date")
+    status = c2.multiselect("Expiry status", ["Expired", "≤ 3 months", "≤ 6 months", "OK", "No expiry"])
+    as_of = c3.date_input("As of date", TODAY, help="See the stock position on any past date")
     bdf = db.stock_by_batch(engine, as_of=as_of)
     if q:
         m = (bdf["name"].str.contains(q, case=False, na=False, regex=False)
              | bdf["manufacturer"].str.contains(q, case=False, na=False, regex=False)
              | bdf["code"].str.contains(q, case=False, na=False, regex=False))
         bdf = bdf[m]
-    if cats:
-        bdf = bdf[bdf["category"].isin(cats)]
     if status:
         bdf = bdf[bdf["status"].isin(status)]
     t1, t2 = st.tabs(["By product", "By batch / expiry"])
@@ -796,9 +793,6 @@ def page_setup():
                         [c.lower() for c in df.columns].index("product")]].astype(str).str.strip() != ""]
         if df is not None:
             st.caption(f"{len(df)} rows")
-            if "category" not in {str(c).strip().lower() for c in df.columns}:
-                st.info("This file has no Category column, so new products will be filed under 'Other'. "
-                        "The bundled count sheets already carry categories.")
             if "needs_check" in df.columns:
                 flagged = df[df["needs_check"].str.upper() == "YES"]
                 if len(flagged):

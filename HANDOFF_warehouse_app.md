@@ -85,7 +85,7 @@ Transaction numbers look like `TRF-000123`.
 ### UI pages (`app.py`, sidebar radio)
 
 1. **Dashboard:** KPIs, net units per branch this month, expiry watch, recent activity, items below reorder level.
-2. **Stock on Hand:** by product or by batch; search, category and status filters; as-of date; CSV export.
+2. **Stock on Hand:** by product or by batch; search (name or code) and expiry-status filters; as-of date; CSV export.
 3. **Receive Stock:** supplier (new or existing, Local or Overseas), invoice number, and a `st.data_editor` for lines (product select, expiry typed as MM/YY, batch number, qty). Expired stock is blocked, short-dated stock warned. A confirmation checkbox is required.
 4. **Transfer to Branch:** batch select (FEFO-sorted, expired batches excluded, availability shown), overdraw validation, FEFO warning, and an Excel transfer note to download.
 5. **Returns & Adjustments:** return from branch, write-off (one click for all expired stock), count correction (enter the counted qty and the app posts the difference).
